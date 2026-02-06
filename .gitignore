@@ -34,3 +34,7 @@ go.work.sum
 
 # node modules
 node_modules/
+
+downloads/
+
+.DS_Store

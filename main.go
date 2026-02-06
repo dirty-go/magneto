@@ -100,5 +100,6 @@ func main() {
 	case <-sig:
 		fmt.Println("\nInterrupted, saving progress…")
 	}
-	fmt.Println("\nDownload completed")
+
+	os.Exit(0)
 }
