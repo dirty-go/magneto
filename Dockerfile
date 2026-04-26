@@ -31,7 +31,7 @@ RUN addgroup -g $GID -S $GROUP_NAME \
     --no-create-home -u $UID -S $USER_NAME -G $GROUP_NAME
 
 
-COPY --from=builder /magneto.internal/bin/magneto ./magneto
+COPY --from=builder /magneto.internal/bin/magneto ./bin/magneto
 USER "${USER_NAME}"
 
 # Command to run the executable
