@@ -1,12 +1,14 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -15,7 +17,7 @@ import (
 
 var (
 	magnetLink = flag.String("magnet", "", "Magnet link")
-	outputDir  = flag.String("out", "./downloads", "Download directory")
+	outputDir  = flag.String("out", "", "Download directory")
 	noSeed     = flag.Bool("no-seed", true, "Disable seeding after download")
 )
 
@@ -26,9 +28,29 @@ func main() {
 		log.Fatal("magnet link is required")
 	}
 
-	err := os.MkdirAll(*outputDir, 0755)
-	if err != nil {
-		log.Fatal(err)
+	// If output directory is not provided, use "Downloads" in the current directory
+	if outputDir == nil || *outputDir == "" {
+		_, filename, _, _ := runtime.Caller(0)
+		dir := filepath.Dir(filename)
+		downloadDir := filepath.Join(dir, "Downloads")
+		stats, err := os.Stat(downloadDir)
+		if err == nil {
+			if stats.IsDir() {
+				outputDir = &downloadDir
+			}
+		} else if errors.Is(err, os.ErrNotExist) {
+			fmt.Println("Directory does not exist.")
+			err := os.MkdirAll(*&downloadDir, 0755)
+			if err != nil {
+				log.Fatal(err)
+				os.Exit(0)
+			}
+			outputDir = &downloadDir
+		} else {
+			// Some other error occurred (e.g., permissions)
+			log.Fatalf("Error checking directory: %w\n", err)
+			os.Exit(0)
+		}
 	}
 
 	cfg := torrent.NewDefaultClientConfig()
