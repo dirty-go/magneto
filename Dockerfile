@@ -24,6 +24,8 @@ ARG WORKSPACE=/app
 
 WORKDIR ${WORKSPACE}
 
+ENV PATH="${PATH}:${WORKSPACE}/bin"
+
 RUN apk --no-cache add ca-certificates
 RUN addgroup -g $GID -S $GROUP_NAME \
     && adduser --shell /sbin/nologin --disabled-password \
@@ -35,4 +37,4 @@ COPY --from=builder /magneto.internal/bin/magneto ./bin/magneto
 USER "${USER_NAME}"
 
 # Command to run the executable
-ENTRYPOINT ["./magneto"]
+ENTRYPOINT ["magneto"]
