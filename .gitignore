@@ -31,6 +31,10 @@ go.work.sum
 .idea/
 .vscode/
 
+# Claude Code personal instructions (not shared)
+CLAUDE.local.md
+.claude/settings.local.json
+
 
 # node modules
 node_modules/
