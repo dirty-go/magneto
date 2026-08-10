@@ -40,7 +40,7 @@ func main() {
 			}
 		} else if errors.Is(err, os.ErrNotExist) {
 			fmt.Println("Directory does not exist.")
-			err := os.MkdirAll(*&downloadDir, 0755)
+			err := os.MkdirAll(downloadDir, 0755)
 			if err != nil {
 				log.Fatal(err)
 				os.Exit(0)
@@ -48,7 +48,7 @@ func main() {
 			outputDir = &downloadDir
 		} else {
 			// Some other error occurred (e.g., permissions)
-			log.Fatalf("Error checking directory: %w\n", err)
+			log.Fatalf("Error checking directory: %v\n", err)
 			os.Exit(0)
 		}
 	}
