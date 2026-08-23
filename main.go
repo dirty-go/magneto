@@ -56,6 +56,7 @@ func main() {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DataDir = *outputDir
 	cfg.NoUpload = *noSeed
+	cfg.ListenPort = 0 // let the OS pick a free port so multiple instances can run concurrently
 
 	client, err := torrent.NewClient(cfg)
 	if err != nil {
