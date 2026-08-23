@@ -14,15 +14,32 @@ Requires Go 1.25+.
 go install github.com/dirty-go/magneto@latest
 ```
 
+Or, one-liner that clones the repo and installs it (requires `git` and
+`go`; add `--with-docker` to also build the local Docker image, which
+additionally requires `docker`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dirty-go/magneto/main/install.sh | sh
+# or: curl -fsSL .../install.sh | sh -s -- --with-docker
+```
+
 Or from a local checkout:
 
 ```sh
 ./lib/install.sh
+# or: make install
 ```
 
 This runs `go install .` and places `magneto` in `$(go env GOBIN)`
 (defaults to `$(go env GOPATH)/bin`, typically `~/go/bin`) — make sure
 that's on your `PATH`.
+
+## Makefile
+
+- `make build` — `go build` a binary for the host OS/arch into `bin/`
+- `make install` — `go install .`
+- `make docker` — `docker build`, targeting `--platform linux/<host-arch>`
+- `make clean` — remove `bin/`
 
 ## Usage
 
@@ -48,6 +65,7 @@ Build:
 
 ```sh
 docker build -t magneto .
+# or: make docker
 ```
 
 Run against a local image:
