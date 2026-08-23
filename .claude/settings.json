@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"\nimport json, sys, subprocess\nd = json.load(sys.stdin)\nf = d.get('tool_input', {}).get('file_path', '')\nif f.endswith('.go'):\n    subprocess.run(['gofmt', '-w', f])\n\" 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}
