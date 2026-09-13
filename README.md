@@ -1,10 +1,12 @@
 # magneto
 
-A minimal CLI that downloads media from a magnet link, then exits. Built on
+A minimal CLI that downloads media from one or more magnet links
+concurrently, then exits. Built on
 [`anacrolix/torrent`](https://github.com/anacrolix/torrent).
 
 Only files with these extensions are downloaded: `.mp4 .mkv .avi .mp3 .flac
-.wav`. If none match, it exits with "No media files found in torrent".
+.wav`. If a torrent has none, that download fails with "no media files found
+in torrent" while the others continue.
 
 ## Install
 
@@ -44,20 +46,33 @@ that's on your `PATH`.
 ## Usage
 
 ```sh
-magneto -magnet <magnet-uri> [-out <dir>] [-no-seed=<bool>]
+magneto -magnet <uri>[,<uri>...] [-magnet <uri>...] [-parallel N] [-out <dir>] [-no-seed=<bool>]
 ```
 
-| Flag       | Default                  | Description                             |
-|------------|---------------------------|------------------------------------------|
-| `-magnet`  | *(required)*               | Magnet link to download from             |
-| `-out`     | `./Downloads`              | Download directory                       |
-| `-no-seed` | `true`                     | Disable seeding after download completes |
+| Flag        | Default       | Description                                                        |
+|-------------|---------------|--------------------------------------------------------------------|
+| `-magnet`   | *(required)*  | Magnet link; repeat the flag or pass a comma-separated list        |
+| `-parallel` | `0`           | Max simultaneous downloads (`0` = all at once)                     |
+| `-out`      | `./Downloads` | Download directory                                                 |
+| `-no-seed`  | `true`        | Disable seeding after download completes                           |
+
+Multiple magnets download concurrently over a single torrent client:
+
+```sh
+magneto -out ~/media -magnet "magnet:?xt=urn:btih:AAA..." -magnet "magnet:?xt=urn:btih:BBB..."
+magneto -out ~/media -parallel 2 -magnet "magnet:?xt=...,magnet:?xt=...,magnet:?xt=..."
+```
+
+Each progress line is prefixed with the magnet's position and torrent name
+(e.g. `[2] Some.Name  42.10% | 512/1216 MB | peers: 12`). A failing magnet
+is logged and does not stop the others; the exit code is non-zero if any
+download failed.
 
 Running from source with `go run`, `-out` defaults to a `Downloads`
 directory next to `main.go`. Running a compiled binary, pass `-out`
 explicitly.
 
-Press Ctrl+C to interrupt; progress is saved.
+Press Ctrl+C to interrupt all downloads; progress is saved. Press it again to force-quit.
 
 ## Docker
 
