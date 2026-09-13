@@ -74,6 +74,26 @@ explicitly.
 
 Press Ctrl+C to interrupt all downloads; progress is saved. Press it again to force-quit.
 
+## Shell completion
+
+Flag completion scripts live in [`completions/`](completions/).
+
+Bash — source it directly, or drop it into your completion directory:
+
+```sh
+source completions/magneto.bash
+# or: cp completions/magneto.bash /etc/bash_completion.d/magneto
+```
+
+Zsh — add `completions/` to your `fpath` before `compinit` runs (in
+`~/.zshrc`), or drop `_magneto` into a directory already on `fpath`:
+
+```sh
+fpath=(/path/to/magneto/completions $fpath)
+autoload -Uz compinit && compinit
+# or: cp completions/_magneto "$(brew --prefix)/share/zsh/site-functions/_magneto"
+```
+
 ## Docker
 
 Build:
