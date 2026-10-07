@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -55,10 +56,10 @@ func (m *magnetList) Set(v string) error {
 
 func main() {
 	var magnets magnetList
-	flag.Var(&magnets, "magnet", "Magnet link (required); repeat the flag or pass a comma-separated list to download several concurrently")
+	flag.Var(&magnets, "magnet", "Magnet link or path to a file of newline-separated magnet links (required); repeat the flag or pass a comma-separated list to download several concurrently")
 	flag.Usage = func() {
 		_, _ = fmt.Fprintf(flag.CommandLine.Output(), // nothing useful to do if writing usage fails
-			"Usage: %s -magnet <uri>[,<uri>...] [-magnet <uri>...] [-parallel N] [-out <dir>] [-no-seed=<bool>]\n\n",
+			"Usage: %s -magnet <uri|file>[,<uri|file>...] [-magnet <uri|file>...] [-parallel N] [-out <dir>] [-no-seed=<bool>]\n\n",
 			filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
 	}
@@ -70,6 +71,10 @@ func main() {
 }
 
 func run(magnets []string) error {
+	magnets, err := expandMagnets(magnets)
+	if err != nil {
+		return err
+	}
 	if len(magnets) == 0 {
 		return errors.New("at least one -magnet link is required")
 	}
@@ -154,6 +159,59 @@ func dedupe(magnets []string) []string {
 		}
 	}
 	return out
+}
+
+// expandMagnets returns entries with every non-magnet entry treated as a path
+// to a batch file and replaced by the magnet URIs it lists, one per line.
+func expandMagnets(entries []string) ([]string, error) {
+	var out []string
+	for _, e := range entries {
+		if strings.HasPrefix(strings.ToLower(e), "magnet:") {
+			out = append(out, e)
+			continue
+		}
+		uris, err := readBatchFile(e)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, uris...)
+	}
+	return out, nil
+}
+
+// readBatchFile reads newline-separated magnet URIs from path, skipping blank
+// lines.
+func readBatchFile(path string) ([]string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("%q is neither a magnet URI nor a readable file: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%q is not a regular file", path)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open batch file: %w", err)
+	}
+	defer func() { _ = f.Close() }() // read-only; close error carries no data loss
+
+	var uris []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(strings.ToLower(line), "magnet:") {
+			return nil, fmt.Errorf("%s: invalid magnet URI %q", path, line)
+		}
+		uris = append(uris, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	return uris, nil
 }
 
 // resolveOutputDir returns dir, or when empty a "Downloads" directory next to
