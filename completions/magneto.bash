@@ -17,15 +17,24 @@ _magneto() {
 
 	case "$prev" in
 	-out)
+		local IFS=$'\n' # one name per line: keep spaces inside names
+		compopt -o filenames 2>/dev/null
 		COMPREPLY=($(compgen -d -- "$cur"))
+		return 0
+		;;
+	-magnet)
+		# A magnet URI can't be completed, but a batch file can.
+		local IFS=$'\n' # one name per line: keep spaces inside names
+		compopt -o filenames 2>/dev/null # bash 4+: add "/" to dirs, escape names
+		COMPREPLY=($(compgen -f -- "$cur"))
 		return 0
 		;;
 	-no-seed)
 		COMPREPLY=($(compgen -W "true false" -- "$cur"))
 		return 0
 		;;
-	-parallel | -magnet)
-		# No sensible values to suggest (an integer, a magnet URI).
+	-parallel)
+		# No sensible values to suggest (an integer).
 		return 0
 		;;
 	esac

@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	alog "github.com/anacrolix/log"
 	"github.com/anacrolix/torrent"
 )
 
@@ -34,10 +35,6 @@ var mediaExt = map[string]bool{
 	".flac": true,
 	".wav":  true,
 }
-
-// console serializes stdout writes: log.Logger emits each message in a single
-// locked Write, so concurrent downloads never interleave mid-line.
-var console = log.New(os.Stdout, "", 0)
 
 // magnetList is a flag.Value that collects magnet URIs from repeated -magnet
 // flags and from comma-separated values within one flag.
@@ -85,10 +82,20 @@ func run(magnets []string) error {
 		return err
 	}
 
+	// From here on all output goes through p, so log lines (stderr) print
+	// above the progress block instead of corrupting it.
+	p := newProgress(os.Stdout, os.Stderr, isTerminal(os.Stdout), len(magnets))
+	p.rows = terminalRows(os.Stdout)
+	log.SetOutput(logWriter{p})
+	alog.Default = p.alogger()
+
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DataDir = dir
 	cfg.NoUpload = *noSeed
 	cfg.ListenPort = 0 // let the OS pick a free port so multiple instances can run concurrently
+	// With Slogger set and Logger zero, the client points its legacy Logger at
+	// Slogger too (Client.getLoggers), so all library logging goes through p.
+	cfg.Slogger = p.slogger()
 
 	client, err := torrent.NewClient(cfg)
 	if err != nil {
@@ -116,6 +123,7 @@ func run(magnets []string) error {
 			defer func() {
 				// One magnet's download must never take the others down with it.
 				if r := recover(); r != nil {
+					p.Fail(i)
 					log.Printf("%s panic: %v", tag, r)
 					failed.Add(1)
 				}
@@ -128,7 +136,8 @@ func run(magnets []string) error {
 					return
 				}
 			}
-			if err := download(ctx, client, tag, uri); err != nil && !errors.Is(err, context.Canceled) {
+			if err := download(ctx, client, p, i, uri); err != nil && !errors.Is(err, context.Canceled) {
+				p.Fail(i)
 				log.Printf("%s failed: %v", tag, err)
 				failed.Add(1)
 			}
@@ -137,7 +146,7 @@ func run(magnets []string) error {
 	wg.Wait()
 
 	if ctx.Err() != nil {
-		console.Println("Interrupted, progress saved")
+		p.Printf("Interrupted, progress saved")
 	}
 	if n := failed.Load(); n > 0 {
 		return fmt.Errorf("%d of %d downloads failed", n, len(magnets))
@@ -179,39 +188,66 @@ func expandMagnets(entries []string) ([]string, error) {
 	return out, nil
 }
 
+// maxBatchEntries caps the magnet URIs read from one batch file; each one
+// costs a goroutine and a progress line.
+const maxBatchEntries = 10_000
+
 // readBatchFile reads newline-separated magnet URIs from path, skipping blank
-// lines.
+// lines and a leading UTF-8 BOM. A file with no URIs is an error.
 func readBatchFile(path string) ([]string, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, fmt.Errorf("%q is neither a magnet URI nor a readable file: %w", path, err)
+	f, errOpen := os.Open(path)
+	if errOpen != nil {
+		return nil, fmt.Errorf("%q is neither a magnet URI nor a readable file: %w", path, errOpen)
+	}
+	defer func() { _ = f.Close() }() // read-only; close error carries no data loss
+
+	info, errStat := f.Stat()
+	if errStat != nil {
+		return nil, fmt.Errorf("stat batch file: %w", errStat)
 	}
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("%q is not a regular file", path)
 	}
 
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open batch file: %w", err)
-	}
-	defer func() { _ = f.Close() }() // read-only; close error carries no data loss
-
 	var uris []string
 	scanner := bufio.NewScanner(f)
+	n := 0
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+		n++
+		line := scanner.Text()
+		if n == 1 {
+			line = strings.TrimPrefix(line, "\uFEFF")
+		}
+		if line = strings.TrimSpace(line); line == "" {
 			continue
 		}
 		if !strings.HasPrefix(strings.ToLower(line), "magnet:") {
-			return nil, fmt.Errorf("%s: invalid magnet URI %q", path, line)
+			return nil, fmt.Errorf("%s:%d: invalid magnet URI %q", path, n, truncate(line, 80))
+		}
+		if len(uris) == maxBatchEntries {
+			return nil, fmt.Errorf("%s:%d: more than %d magnet URIs; split the file", path, n, maxBatchEntries)
 		}
 		uris = append(uris, line)
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
+	if errScan := scanner.Err(); errScan != nil {
+		return nil, fmt.Errorf("%s:%d: %w", path, n+1, errScan)
+	}
+	if len(uris) == 0 {
+		return nil, fmt.Errorf("no magnet URIs in %s", path)
 	}
 	return uris, nil
+}
+
+// maxNameRunes caps torrent names and file paths, which the remote side
+// controls, in progress lines and log messages.
+const maxNameRunes = 120
+
+// truncate shortens s to at most n runes, marking a cut with "…".
+func truncate(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n]) + "…"
+	}
+	return s
 }
 
 // resolveOutputDir returns dir, or when empty a "Downloads" directory next to
@@ -228,22 +264,24 @@ func resolveOutputDir(dir string) (string, error) {
 	return dir, nil
 }
 
-// download fetches the media files of one magnet on the shared client and
-// blocks until they are complete or ctx is cancelled (returning ctx.Err()).
-func download(ctx context.Context, client *torrent.Client, tag, uri string) error {
+// download fetches the media files of magnet i on the shared client, reporting
+// to p, and blocks until they are complete or ctx is cancelled (returning
+// ctx.Err()).
+func download(ctx context.Context, client *torrent.Client, p *progress, i int, uri string) error {
+	tag := fmt.Sprintf("[%d]", i+1)
 	t, err := client.AddMagnet(uri)
 	if err != nil {
 		return fmt.Errorf("add magnet: %w", err)
 	}
 	defer t.Drop()
 
-	console.Printf("%s fetching metadata...", tag)
+	p.Update(i, tag, "fetching metadata...")
 	select {
 	case <-t.GotInfo():
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	tag += " " + t.Name()
+	tag += " " + truncate(stripCtl(t.Name()), maxNameRunes)
 
 	var (
 		selected []*torrent.File
@@ -253,7 +291,7 @@ func download(ctx context.Context, client *torrent.Client, tag, uri string) erro
 		if !mediaExt[strings.ToLower(filepath.Ext(f.Path()))] {
 			continue
 		}
-		console.Printf("%s downloading: %s", tag, f.Path())
+		p.Printf("%s downloading: %s", tag, truncate(stripCtl(f.Path()), maxNameRunes))
 		f.Download()
 		selected = append(selected, f)
 		total += f.Length()
@@ -278,10 +316,10 @@ func download(ctx context.Context, client *torrent.Client, tag, uri string) erro
 			done += f.BytesCompleted()
 		}
 		if done >= total {
-			console.Printf("%s download completed", tag)
+			p.Update(i, tag, statusDone)
 			return nil
 		}
-		console.Printf("%s %6.2f%% | %d/%d MB | peers: %d",
-			tag, float64(done)/float64(total)*100, done>>20, total>>20, t.Stats().ActivePeers)
+		p.Update(i, tag, fmt.Sprintf("%6.2f%% | %d/%d MB | peers: %d",
+			float64(done)/float64(total)*100, done>>20, total>>20, t.Stats().ActivePeers))
 	}
 }
