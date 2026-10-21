@@ -1,7 +1,7 @@
 # magneto
 
-A minimal CLI that downloads media from one or more magnet links
-concurrently, then exits. Built on
+A minimal CLI that downloads media from one or more magnet links or local
+`.torrent` files concurrently, then exits. Built on
 [`anacrolix/torrent`](https://github.com/anacrolix/torrent).
 
 Only files with these extensions are downloaded: `.mp4 .mkv .avi .mp3 .flac
@@ -46,12 +46,15 @@ that's on your `PATH`.
 ## Usage
 
 ```sh
-magneto -magnet <uri|file>[,<uri|file>...] [-magnet <uri|file>...] [-parallel N] [-out <dir>] [-no-seed=<bool>]
+magneto [-magnet <uri|file>[,...]]... [-torrent <file>[,...]]... [-parallel N] [-out <dir>] [-no-seed=<bool>]
 ```
+
+At least one `-magnet` or `-torrent` is required.
 
 | Flag        | Default       | Description                                                        |
 |-------------|---------------|--------------------------------------------------------------------|
-| `-magnet`   | *(required)*  | Magnet link or batch file; repeat the flag or pass a comma list    |
+| `-magnet`   |               | Magnet link or batch file; repeat the flag or pass a comma list    |
+| `-torrent`  |               | Local `.torrent` file; repeat the flag or pass a comma list        |
 | `-parallel` | `0`           | Max simultaneous downloads (`0` = all at once)                     |
 | `-out`      | `./Downloads` | Download directory                                                 |
 | `-no-seed`  | `true`        | Disable seeding after download completes                           |
@@ -79,6 +82,17 @@ magneto -out ~/media -magnet "season1.txt,season2.txt"
 Every `-magnet` value is split on commas, so a batch-file path containing a
 comma isn't supported; rename the file or pass a path without one.
 
+`-torrent` loads local `.torrent` files (up to 32 MiB each) and can be mixed
+with `-magnet` in the same run; they share the same concurrency, `-parallel`
+limit and progress display. Its values are split on commas too. Duplicates are
+matched by infohash, so the same torrent given as a magnet and as a `.torrent`
+file is downloaded once. A missing, unreadable or invalid `.torrent` file is
+reported with its path as one failed download; the others still run:
+
+```sh
+magneto -out ~/media -torrent show.torrent -torrent "a.torrent,b.torrent" -magnet season1.txt
+```
+
 On a terminal, each torrent gets one line, ordered by its position, that is
 redrawn in place every 2 seconds; messages print above the block:
 
@@ -93,7 +107,7 @@ lines stay visible and the rest are summarised as `… N more (X done, Y
 queued)`. A failed torrent's line shows `failed`. When output is not a
 terminal (a pipe, file, `docker logs`, or `TERM=dumb`), each update is
 printed as a new plain line instead, with no ANSI escape codes. Control
-characters in torrent names and file paths are stripped from all output. A failing magnet is logged and does not
+characters in torrent names and file paths are stripped from all output. A failing magnet or `.torrent` is logged and does not
 stop the others; the exit code is non-zero if any download failed.
 
 Running from source with `go run`, `-out` defaults to a `Downloads`
@@ -128,7 +142,8 @@ Fish — copy it into fish's completions directory:
 cp completions/magneto.fish ~/.config/fish/completions/
 ```
 
-`-magnet` completes file paths (for batch files) in all three shells.
+`-magnet` completes file paths (for batch files) and `-torrent` completes
+`*.torrent` files in all three shells.
 
 ## Docker
 

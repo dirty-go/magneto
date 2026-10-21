@@ -13,7 +13,7 @@ _magneto() {
 	COMPREPLY=()
 	cur=${COMP_WORDS[COMP_CWORD]}
 	prev=${COMP_WORDS[COMP_CWORD - 1]}
-	opts="-magnet -out -no-seed -parallel -h -help"
+	opts="-magnet -torrent -out -no-seed -parallel -h -help"
 
 	case "$prev" in
 	-out)
@@ -27,6 +27,15 @@ _magneto() {
 		local IFS=$'\n' # one name per line: keep spaces inside names
 		compopt -o filenames 2>/dev/null # bash 4+: add "/" to dirs, escape names
 		COMPREPLY=($(compgen -f -- "$cur"))
+		return 0
+		;;
+	-torrent)
+		# .torrent files, plus directories to descend into.
+		local IFS=$'\n' opts=$- # one name per line: keep spaces inside names
+		compopt -o filenames 2>/dev/null
+		set -f # the results are names: don't glob-expand a * or ? in them
+		COMPREPLY=($(compgen -d -- "$cur"; compgen -f -X '!*.torrent' -- "$cur"))
+		[[ $opts == *f* ]] || set +f
 		return 0
 		;;
 	-no-seed)
