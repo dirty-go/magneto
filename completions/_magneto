@@ -11,6 +11,7 @@
 _magneto() {
 	_arguments \
 		'*-magnet[Magnet link or batch file of links; repeat or comma-separate for multiple]:magnet uri or batch file:_files' \
+		'*-torrent[Local .torrent file; repeat or comma-separate for multiple]:torrent file:_files -g "*.torrent(-.)"' \
 		'-out[Download directory]:directory:_files -/' \
 		'-no-seed[Disable seeding after download]:enabled:(true false)' \
 		'-parallel[Max simultaneous downloads (0 = unlimited)]:count:' \
