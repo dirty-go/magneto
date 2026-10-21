@@ -1,4 +1,4 @@
-FROM golang:1.25 AS builder
+FROM golang:1.27.3@sha256:f24164268fc1e741bbdc0066dbadcf1c8426c5a8489f0729c02c3905a53032fd AS builder
 
 WORKDIR /magneto.internal
 
@@ -14,7 +14,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ./bin/magneto \
     -ldflags="-s -w" \
     .
 
-FROM alpine:3.23
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 
 ARG UID=10001
 ARG GID=10001

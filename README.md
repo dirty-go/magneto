@@ -10,7 +10,7 @@ in torrent" while the others continue.
 
 ## Install
 
-Requires Go 1.25+.
+Requires Go 1.27+.
 
 ```sh
 go install github.com/dirty-go/magneto@latest

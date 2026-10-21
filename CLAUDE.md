@@ -35,9 +35,17 @@ CI (`.github/` does not exist in this repo at all).
   *source file*. That's meaningless once run from a compiled binary (e.g.
   in the Docker image) — only reliable when run with `go run` from
   source. Pass `-out` explicitly in any other context.
-- `go.mod` has no direct `require` block — everything is marked
-  `// indirect` even though `anacrolix/torrent` is a direct import. This
-  is expected; it still builds fine.
+- `go.mod` pins `toolchain go1.27.3` (the first 1.27 patch clearing the
+  stdlib `net/http`/`crypto` advisories `govulncheck` reports); with the
+  default `GOTOOLCHAIN=auto`, an older local Go downloads it automatically.
+  A `golangci-lint` binary built with an older 1.27 patch then fails with
+  `export data version 5 is greater than maximum supported version 4`;
+  run it as `GOTOOLCHAIN=local golangci-lint run ./...` until it's rebuilt.
+- Dockerfile base images are pinned by multi-arch index digest
+  (`tag@sha256:...`) with no Renovate/Dependabot — refresh them by hand
+  (registry `Docker-Content-Digest`, not a per-arch digest from the Hub
+  tags API), and keep the `golang:` tag ≥ the `go.mod` toolchain since
+  the official image sets `GOTOOLCHAIN=local`.
 - `-no-seed` defaults to `true`.
 - `lib/ghcr-push.sh` has dead `-u -p -n -o -v` flags left over from an
   earlier version — ignore them.
