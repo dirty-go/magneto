@@ -10,6 +10,8 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -59,10 +61,10 @@ func (m *stringList) Set(v string) error {
 func main() {
 	var magnets, torrents stringList
 	flag.Var(&magnets, "magnet", "Magnet link or path to a file of newline-separated magnet links; repeat the flag or pass a comma-separated list to download several concurrently")
-	flag.Var(&torrents, "torrent", "Path to a local .torrent file; repeat the flag or pass a comma-separated list")
+	flag.Var(&torrents, "torrent", "Path to a local .torrent file or an http(s) URL of one; repeat the flag or pass a comma-separated list")
 	flag.Usage = func() {
 		_, _ = fmt.Fprintf(flag.CommandLine.Output(), // nothing useful to do if writing usage fails
-			"Usage: %s [-magnet <uri|file>[,...]]... [-torrent <file>[,...]]... [-parallel N] [-out <dir>] [-no-seed=<bool>]\n"+
+			"Usage: %s [-magnet <uri|file>[,...]]... [-torrent <file|url>[,...]]... [-parallel N] [-out <dir>] [-no-seed=<bool>]\n"+
 				"At least one -magnet or -torrent is required.\n\n",
 			filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
@@ -82,7 +84,16 @@ func run(magnets, torrents []string) error {
 	if len(magnets)+len(torrents) == 0 {
 		return errors.New("at least one -magnet or -torrent is required")
 	}
-	sources := dedupe(resolveSources(magnets, torrents))
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	// Once interrupted, restore default SIGINT handling so a second Ctrl+C force-quits.
+	context.AfterFunc(ctx, stop)
+
+	sources := dedupe(resolveSources(ctx, newHTTPClient(fetchTimeout), magnets, torrents))
+	if ctx.Err() != nil {
+		return errors.New("interrupted before downloads started")
+	}
 
 	dir, err := resolveOutputDir(*outputDir)
 	if err != nil {
@@ -109,11 +120,6 @@ func run(magnets, torrents []string) error {
 		return fmt.Errorf("create torrent client: %w", err)
 	}
 	defer client.Close()
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-	// Once interrupted, restore default SIGINT handling so a second Ctrl+C force-quits.
-	context.AfterFunc(ctx, stop)
 
 	var sem chan struct{} // nil = unlimited
 	if *parallel > 0 {
@@ -172,20 +178,29 @@ func run(magnets, torrents []string) error {
 // source that fails to resolve keeps its error and is reported as one failed
 // download without stopping the others.
 type source struct {
-	ref  string               // the magnet URI or file path given, for messages
+	ref  string               // the magnet URI, file path or redacted URL given, for messages
 	spec *torrent.TorrentSpec // nil when err != nil
 	err  error
 }
 
 // resolveSources resolves magnet URIs (already expanded from batch files) and
-// .torrent file paths, in that order.
-func resolveSources(magnets, torrentFiles []string) []source {
-	out := make([]source, 0, len(magnets)+len(torrentFiles))
+// .torrent file paths or URLs, in that order. URLs are fetched with hc, one at
+// a time, and abandoned when ctx is cancelled.
+func resolveSources(ctx context.Context, hc *http.Client, magnets, torrentRefs []string) []source {
+	out := make([]source, 0, len(magnets)+len(torrentRefs))
 	for _, uri := range magnets {
 		out = append(out, resolveMagnet(uri))
 	}
-	for _, path := range torrentFiles {
-		out = append(out, resolveTorrentFile(path))
+	for _, ref := range torrentRefs {
+		u, err := parseTorrentURL(ref)
+		switch {
+		case err != nil: // ref may hold credentials; err has it redacted
+			out = append(out, source{ref: "(rejected URL)", err: err})
+		case u != nil:
+			out = append(out, resolveTorrentURL(ctx, hc, u))
+		default:
+			out = append(out, resolveTorrentFile(ref))
+		}
 	}
 	return out
 }
@@ -209,6 +224,139 @@ func resolveTorrentFile(path string) source {
 		return source{ref: path, err: fmt.Errorf("torrent file %q: %w", path, err)}
 	}
 	return source{ref: path, spec: spec}
+}
+
+// resolveTorrentURL fetches the .torrent file at u into a source.
+func resolveTorrentURL(ctx context.Context, hc *http.Client, u *url.URL) source {
+	ref := redactURL(u)
+	spec, err := fetchTorrent(ctx, hc, u)
+	if err != nil {
+		return source{ref: ref, err: fmt.Errorf("torrent URL %q: %w", ref, err)}
+	}
+	return source{ref: ref, spec: spec}
+}
+
+// Limits on fetching .torrent URLs.
+const (
+	fetchTimeout = 30 * time.Second // whole request, body included
+	maxRedirects = 5
+)
+
+// newHTTPClient returns the client .torrent URLs are fetched with: requests
+// time out after timeout, and redirects are capped, must stay on http(s) and
+// can't downgrade from https. No Referer is sent, so a token in the query
+// doesn't leak to the redirect target.
+func newHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) > maxRedirects {
+				return fmt.Errorf("more than %d redirects", maxRedirects)
+			}
+			if !isHTTPScheme(req.URL.Scheme) {
+				return fmt.Errorf("redirect to unsupported scheme %q", truncate(req.URL.Scheme, 20))
+			}
+			if via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+				return errors.New("redirect from https to http")
+			}
+			req.Header.Del("Referer")
+			return nil
+		},
+	}
+}
+
+func isHTTPScheme(s string) bool { return s == "http" || s == "https" }
+
+// parseTorrentURL returns the URL in ref, or nil when ref is a local path.
+// Only "scheme://..." counts as a URL, so a Windows path like C:\x.torrent stays
+// a path. A URL whose scheme isn't http or https is an error. Errors carry the
+// URL redacted.
+func parseTorrentURL(ref string) (*url.URL, error) {
+	scheme, _, ok := strings.Cut(ref, "://")
+	if !ok || !isURLScheme(scheme) {
+		return nil, nil
+	}
+	u, err := url.Parse(ref)
+	if err != nil {
+		// url.Parse's error repeats ref, credentials and all.
+		return nil, errors.New("invalid torrent URL")
+	}
+	if !isHTTPScheme(u.Scheme) { // Parse lowercases the scheme
+		return nil, fmt.Errorf("torrent URL %q: unsupported scheme %q; only http and https are allowed", redactURL(u), truncate(u.Scheme, 20))
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("torrent URL %q: no host", redactURL(u))
+	}
+	return u, nil
+}
+
+// isURLScheme reports whether s is a syntactically valid URI scheme
+// (RFC 3986: a letter, then letters, digits, "+", "-" or ".").
+func isURLScheme(s string) bool {
+	for i, c := range s {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case i > 0 && (c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.'):
+		default:
+			return false
+		}
+	}
+	return s != ""
+}
+
+// redactURL returns u for messages, with any userinfo and query replaced by
+// "REDACTED" and the fragment dropped, since those commonly carry tokens.
+func redactURL(u *url.URL) string {
+	r := *u
+	if r.User != nil {
+		r.User = url.User("REDACTED")
+	}
+	if r.RawQuery != "" {
+		r.RawQuery = "REDACTED"
+	}
+	r.Fragment, r.RawFragment = "", ""
+	return truncate(stripCtl(r.String()), 200)
+}
+
+// fetchTorrent downloads and validates the .torrent file at u. Errors don't
+// repeat the URL; the caller adds it redacted.
+func fetchTorrent(ctx context.Context, hc *http.Client, u *url.URL) (*torrent.TorrentSpec, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, errors.New("invalid request")
+	}
+	req.Header.Set("User-Agent", "magneto")
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, urlErrCause(err)
+	}
+	defer func() { _ = resp.Body.Close() }() // read-only; close error carries no data loss
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		// Not resp.Status: its text comes from the server.
+		return nil, fmt.Errorf("HTTP %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+	if resp.ContentLength > maxTorrentFileSize {
+		return nil, fmt.Errorf("larger than %d MiB", maxTorrentFileSize>>20)
+	}
+	// Content-Length may be absent or wrong, so the read is capped as well.
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxTorrentFileSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", urlErrCause(err))
+	}
+	if len(b) > maxTorrentFileSize {
+		return nil, fmt.Errorf("larger than %d MiB", maxTorrentFileSize>>20)
+	}
+	return parseTorrent(b)
+}
+
+// urlErrCause unwraps a *url.Error, whose message repeats the request URL
+// with its credentials and query.
+func urlErrCause(err error) error {
+	if ue, ok := errors.AsType[*url.Error](err); ok {
+		return ue.Err
+	}
+	return err
 }
 
 // Limits on .torrent files, which are untrusted input. Real ones are rarely
@@ -261,6 +409,11 @@ func loadTorrentFile(path string) (*torrent.TorrentSpec, error) {
 	if len(b) > maxTorrentFileSize {
 		return nil, fmt.Errorf("larger than %d MiB", maxTorrentFileSize>>20)
 	}
+	return parseTorrent(b)
+}
+
+// parseTorrent decodes and validates the .torrent file contents b.
+func parseTorrent(b []byte) (*torrent.TorrentSpec, error) {
 	if err := checkBencodeShape(b); err != nil {
 		return nil, fmt.Errorf("not a valid .torrent file: %w", err)
 	}
