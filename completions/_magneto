@@ -10,7 +10,7 @@
 
 _magneto() {
 	_arguments \
-		'*-magnet[Magnet link or batch file of links; repeat or comma-separate for multiple]:magnet uri or batch file:_files' \
+		'*-magnet[Magnet link or batch file of magnets, .torrent paths and URLs; repeat or comma-separate for multiple]:magnet uri or batch file:_files' \
 		'*-torrent[.torrent file or http(s) URL; repeat or comma-separate for multiple]:torrent file or URL:_files -g "*.torrent(-.)"' \
 		'-out[Download directory]:directory:_files -/' \
 		'-no-seed[Disable seeding after download]:enabled:(true false)' \

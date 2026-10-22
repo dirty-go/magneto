@@ -60,7 +60,7 @@ func (m *stringList) Set(v string) error {
 
 func main() {
 	var magnets, torrents stringList
-	flag.Var(&magnets, "magnet", "Magnet link or path to a file of newline-separated magnet links; repeat the flag or pass a comma-separated list to download several concurrently")
+	flag.Var(&magnets, "magnet", "Magnet link or path to a batch file of newline-separated magnet links, .torrent paths and http(s) .torrent URLs; repeat the flag or pass a comma-separated list to download several concurrently")
 	flag.Var(&torrents, "torrent", "Path to a local .torrent file or an http(s) URL of one; repeat the flag or pass a comma-separated list")
 	flag.Usage = func() {
 		_, _ = fmt.Fprintf(flag.CommandLine.Output(), // nothing useful to do if writing usage fails
@@ -77,11 +77,14 @@ func main() {
 }
 
 func run(magnets, torrents []string) error {
-	magnets, err := expandMagnets(magnets)
+	refs, err := expandMagnets(magnets)
 	if err != nil {
 		return err
 	}
-	if len(magnets)+len(torrents) == 0 {
+	for _, t := range torrents {
+		refs = append(refs, sourceRef{ref: t, torrent: true})
+	}
+	if len(refs) == 0 {
 		return errors.New("at least one -magnet or -torrent is required")
 	}
 
@@ -90,7 +93,7 @@ func run(magnets, torrents []string) error {
 	// Once interrupted, restore default SIGINT handling so a second Ctrl+C force-quits.
 	context.AfterFunc(ctx, stop)
 
-	sources := dedupe(resolveSources(ctx, newHTTPClient(fetchTimeout), magnets, torrents))
+	sources := dedupe(resolveSources(ctx, newHTTPClient(fetchTimeout), refs))
 	if ctx.Err() != nil {
 		return errors.New("interrupted before downloads started")
 	}
@@ -183,23 +186,37 @@ type source struct {
 	err  error
 }
 
-// resolveSources resolves magnet URIs (already expanded from batch files) and
-// .torrent file paths or URLs, in that order. URLs are fetched with hc, one at
-// a time, and abandoned when ctx is cancelled.
-func resolveSources(ctx context.Context, hc *http.Client, magnets, torrentRefs []string) []source {
-	out := make([]source, 0, len(magnets)+len(torrentRefs))
-	for _, uri := range magnets {
-		out = append(out, resolveMagnet(uri))
-	}
-	for _, ref := range torrentRefs {
-		u, err := parseTorrentURL(ref)
+// sourceRef is one unresolved source: a magnet URI, or a .torrent file path or
+// URL.
+type sourceRef struct {
+	ref     string
+	torrent bool // ref is a .torrent file path or URL, not a magnet URI
+}
+
+// resolveSources resolves refs (already expanded from batch files) in order,
+// skipping exact repeats so a URL or file listed twice is only read once.
+// URLs are fetched with hc, one at a time, and abandoned when ctx is
+// cancelled.
+func resolveSources(ctx context.Context, hc *http.Client, refs []sourceRef) []source {
+	out := make([]source, 0, len(refs))
+	seen := make(map[sourceRef]bool, len(refs))
+	for _, r := range refs {
+		if seen[r] {
+			continue
+		}
+		seen[r] = true
+		if !r.torrent {
+			out = append(out, resolveMagnet(r.ref))
+			continue
+		}
+		u, err := parseTorrentURL(r.ref)
 		switch {
-		case err != nil: // ref may hold credentials; err has it redacted
+		case err != nil: // r.ref may hold credentials; err has it redacted
 			out = append(out, source{ref: "(rejected URL)", err: err})
 		case u != nil:
 			out = append(out, resolveTorrentURL(ctx, hc, u))
 		default:
-			out = append(out, resolveTorrentFile(ref))
+			out = append(out, resolveTorrentFile(r.ref))
 		}
 	}
 	return out
@@ -542,30 +559,34 @@ func dedupe(sources []source) []source {
 }
 
 // expandMagnets returns entries with every non-magnet entry treated as a path
-// to a batch file and replaced by the magnet URIs it lists, one per line.
-func expandMagnets(entries []string) ([]string, error) {
-	var out []string
+// to a batch file and replaced by the sources it lists, one per line.
+func expandMagnets(entries []string) ([]sourceRef, error) {
+	var out []sourceRef
 	for _, e := range entries {
-		if strings.HasPrefix(strings.ToLower(e), "magnet:") {
-			out = append(out, e)
+		if isMagnet(e) {
+			out = append(out, sourceRef{ref: e})
 			continue
 		}
-		uris, err := readBatchFile(e)
+		refs, err := readBatchFile(e)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, uris...)
+		out = append(out, refs...)
 	}
 	return out, nil
 }
 
-// maxBatchEntries caps the magnet URIs read from one batch file; each one
-// costs a goroutine and a progress line.
+func isMagnet(s string) bool { return strings.HasPrefix(strings.ToLower(s), "magnet:") }
+
+// maxBatchEntries caps the entries read from one batch file; each one costs a
+// goroutine and a progress line.
 const maxBatchEntries = 10_000
 
-// readBatchFile reads newline-separated magnet URIs from path, skipping blank
-// lines and a leading UTF-8 BOM. A file with no URIs is an error.
-func readBatchFile(path string) ([]string, error) {
+// readBatchFile reads newline-separated sources from path, skipping blank
+// lines and a leading UTF-8 BOM. A line is a magnet URI, an http(s) .torrent
+// URL or a .torrent file path, relative to path's directory unless absolute;
+// it can't name another batch file. A file with no entries is an error.
+func readBatchFile(path string) ([]sourceRef, error) {
 	f, errOpen := os.Open(path)
 	if errOpen != nil {
 		return nil, fmt.Errorf("%q is neither a magnet URI nor a readable file: %w", path, errOpen)
@@ -580,7 +601,7 @@ func readBatchFile(path string) ([]string, error) {
 		return nil, fmt.Errorf("%q is not a regular file", path)
 	}
 
-	var uris []string
+	var refs []sourceRef
 	scanner := bufio.NewScanner(f)
 	n := 0
 	for scanner.Scan() {
@@ -592,21 +613,50 @@ func readBatchFile(path string) ([]string, error) {
 		if line = strings.TrimSpace(line); line == "" {
 			continue
 		}
-		if !strings.HasPrefix(strings.ToLower(line), "magnet:") {
-			return nil, fmt.Errorf("%s:%d: invalid magnet URI %q", path, n, truncate(line, 80))
+		ref, err := parseBatchLine(filepath.Dir(path), line)
+		if err != nil {
+			return nil, fmt.Errorf("%s:%d: %w", path, n, err)
 		}
-		if len(uris) == maxBatchEntries {
-			return nil, fmt.Errorf("%s:%d: more than %d magnet URIs; split the file", path, n, maxBatchEntries)
+		if len(refs) == maxBatchEntries {
+			return nil, fmt.Errorf("%s:%d: more than %d entries; split the file", path, n, maxBatchEntries)
 		}
-		uris = append(uris, line)
+		refs = append(refs, ref)
 	}
 	if errScan := scanner.Err(); errScan != nil {
 		return nil, fmt.Errorf("%s:%d: %w", path, n+1, errScan)
 	}
-	if len(uris) == 0 {
-		return nil, fmt.Errorf("no magnet URIs in %s", path)
+	if len(refs) == 0 {
+		return nil, fmt.Errorf("no entries in %s", path)
 	}
-	return uris, nil
+	return refs, nil
+}
+
+// parseBatchLine classifies one non-blank batch-file line, resolving a
+// relative .torrent path against dir.
+func parseBatchLine(dir, line string) (sourceRef, error) {
+	if isMagnet(line) {
+		return sourceRef{ref: line}, nil
+	}
+	u, err := parseTorrentURL(line)
+	if err != nil {
+		return sourceRef{}, err // redacted: line may hold credentials
+	}
+	if u != nil {
+		return sourceRef{ref: line, torrent: true}, nil
+	}
+	if !strings.EqualFold(filepath.Ext(line), ".torrent") {
+		const want = "want a magnet URI, .torrent path or http(s) URL"
+		if strings.ContainsAny(line, ":?@") {
+			// Possibly a malformed URL (e.g. "https:/h?token=x") that
+			// parseTorrentURL didn't recognize, so don't echo it.
+			return sourceRef{}, errors.New("invalid entry: " + want)
+		}
+		return sourceRef{}, fmt.Errorf("invalid entry %q: %s", truncate(line, 80), want)
+	}
+	if !filepath.IsAbs(line) {
+		line = filepath.Join(dir, line)
+	}
+	return sourceRef{ref: line, torrent: true}, nil
 }
 
 // maxNameRunes caps torrent names and file paths, which the remote side

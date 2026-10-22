@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -23,42 +25,74 @@ import (
 
 func TestExpandMagnets(t *testing.T) {
 	lines := func(n int) string { return strings.Repeat("magnet:?xt=a\n", n) }
+	m := func(uris ...string) []sourceRef {
+		out := make([]sourceRef, len(uris))
+		for i, u := range uris {
+			out[i] = sourceRef{ref: u}
+		}
+		return out
+	}
+	tor := func(ref string) sourceRef { return sourceRef{ref: ref, torrent: true} }
+	abs := filepath.Join(t.TempDir(), "abs.torrent")
 	tests := []struct {
 		name    string
-		file    *string // contents of list.txt; nil = not created
+		file    *string // contents of the batch file; nil = not created
+		path    string  // batch file path relative to the temp dir; "" = list.txt
 		args    []string
-		want    []string
+		want    []sourceRef // "$DIR" in a ref is replaced by the temp dir
 		wantErr string
 		wantIs  error
 	}{
-		{name: "raw URIs only", args: []string{"magnet:?a", "MAGNET:?b"}, want: []string{"magnet:?a", "MAGNET:?b"}},
+		{name: "raw URIs only", args: []string{"magnet:?a", "MAGNET:?b"}, want: m("magnet:?a", "MAGNET:?b")},
 		{name: "missing file", args: []string{"list.txt"}, wantErr: "neither a magnet URI nor a readable file", wantIs: os.ErrNotExist},
 		{name: "directory", args: []string{"."}, wantErr: "is not a regular file"},
-		{name: "non-magnet line", file: ptr("magnet:?a\nhttp://x\n"), args: []string{"list.txt"}, wantErr: `list.txt:2: invalid magnet URI "http://x"`},
+		{
+			name: "mixed lines",
+			file: ptr("magnet:?a\nhttps://h/x.torrent?k=1\nlocal.torrent\nUP.TORRENT\n" + abs + "\nHTTP://h/dl\nmagnet:?b\n"),
+			args: []string{"list.txt"},
+			want: []sourceRef{{ref: "magnet:?a"}, tor("https://h/x.torrent?k=1"), tor("$DIR/local.torrent"), tor("$DIR/UP.TORRENT"), tor(abs), tor("HTTP://h/dl"), {ref: "magnet:?b"}},
+		},
+		{
+			name: "relative to batch file dir",
+			file: ptr("a.torrent\n../b.torrent\nc/d.torrent\n"),
+			path: "sub/list.txt",
+			args: []string{"sub/list.txt"},
+			want: []sourceRef{tor("$DIR/sub/a.torrent"), tor("$DIR/b.torrent"), tor("$DIR/sub/c/d.torrent")},
+		},
+		{name: "invalid line", file: ptr("magnet:?a\nnope\n"), args: []string{"list.txt"}, wantErr: `list.txt:2: invalid entry "nope"`},
+		{name: "no batch recursion", file: ptr("other.txt\n"), args: []string{"list.txt"}, wantErr: `list.txt:1: invalid entry "other.txt"`},
+		{name: "unsupported scheme redacted", file: ptr("ftp://u:secret@h/x.torrent\n"), args: []string{"list.txt"}, wantErr: `list.txt:1: torrent URL "ftp://REDACTED@h/x.torrent": unsupported scheme "ftp"`},
+		{name: "malformed URL not echoed", file: ptr("https:/h/x?token=secret\n"), args: []string{"list.txt"}, wantErr: "list.txt:1: invalid entry: want a magnet URI"},
+		{name: "URL without host", file: ptr("magnet:?a\nhttp:///x.torrent\n"), args: []string{"list.txt"}, wantErr: "list.txt:2: torrent URL \"http:///x.torrent\": no host"},
 		{name: "bad line truncated", file: ptr(strings.Repeat("x", 200)), args: []string{"list.txt"}, wantErr: `"` + strings.Repeat("x", 80) + `…"`},
-		{name: "blank and whitespace lines", file: ptr("\n  \nmagnet:?a\n\t\n  magnet:?b  \n"), args: []string{"list.txt"}, want: []string{"magnet:?a", "magnet:?b"}},
-		{name: "CRLF", file: ptr("magnet:?a\r\nmagnet:?b\r\n"), args: []string{"list.txt"}, want: []string{"magnet:?a", "magnet:?b"}},
-		{name: "no trailing newline", file: ptr("magnet:?a"), args: []string{"list.txt"}, want: []string{"magnet:?a"}},
-		{name: "BOM", file: ptr("\uFEFFmagnet:?a\n"), args: []string{"list.txt"}, want: []string{"magnet:?a"}},
-		{name: "BOM only stripped on line 1", file: ptr("magnet:?a\n\uFEFFmagnet:?b\n"), args: []string{"list.txt"}, wantErr: "list.txt:2: invalid magnet URI"},
-		{name: "mixed file and URIs", file: ptr("magnet:?a\nmagnet:?b\n"), args: []string{"magnet:?x", "list.txt", "magnet:?y"}, want: []string{"magnet:?x", "magnet:?a", "magnet:?b", "magnet:?y"}},
-		{name: "empty file", file: ptr(""), args: []string{"list.txt"}, wantErr: "no magnet URIs in"},
-		{name: "blank-only file", file: ptr("\n  \r\n\t\n"), args: []string{"list.txt"}, wantErr: "no magnet URIs in"},
+		{name: "blank and whitespace lines", file: ptr("\n  \nmagnet:?a\n\t\n  magnet:?b  \n"), args: []string{"list.txt"}, want: m("magnet:?a", "magnet:?b")},
+		{name: "CRLF", file: ptr("magnet:?a\r\nx.torrent\r\n"), args: []string{"list.txt"}, want: []sourceRef{{ref: "magnet:?a"}, tor("$DIR/x.torrent")}},
+		{name: "no trailing newline", file: ptr("magnet:?a"), args: []string{"list.txt"}, want: m("magnet:?a")},
+		{name: "BOM", file: ptr("\uFEFFmagnet:?a\n"), args: []string{"list.txt"}, want: m("magnet:?a")},
+		{name: "BOM only stripped on line 1", file: ptr("magnet:?a\n\uFEFFmagnet:?b\n"), args: []string{"list.txt"}, wantErr: "list.txt:2: invalid entry"},
+		{name: "mixed file and URIs", file: ptr("magnet:?a\nmagnet:?b\n"), args: []string{"magnet:?x", "list.txt", "magnet:?y"}, want: m("magnet:?x", "magnet:?a", "magnet:?b", "magnet:?y")},
+		{name: "empty file", file: ptr(""), args: []string{"list.txt"}, wantErr: "no entries in"},
+		{name: "blank-only file", file: ptr("\n  \r\n\t\n"), args: []string{"list.txt"}, wantErr: "no entries in"},
 		{name: "line too long", file: ptr("magnet:?" + strings.Repeat("a", bufio.MaxScanTokenSize)), args: []string{"list.txt"}, wantErr: "list.txt:1:", wantIs: bufio.ErrTooLong},
-		{name: "at line cap", file: ptr(lines(maxBatchEntries)), args: []string{"list.txt"}, want: slices.Repeat([]string{"magnet:?xt=a"}, maxBatchEntries)},
-		{name: "over line cap", file: ptr(lines(maxBatchEntries + 1)), args: []string{"list.txt"}, wantErr: "list.txt:10001: more than 10000 magnet URIs"},
+		{name: "at line cap", file: ptr(lines(maxBatchEntries)), args: []string{"list.txt"}, want: m(slices.Repeat([]string{"magnet:?xt=a"}, maxBatchEntries)...)},
+		{name: "over line cap", file: ptr(lines(maxBatchEntries + 1)), args: []string{"list.txt"}, wantErr: "list.txt:10001: more than 10000 entries"},
+		{name: "cap counts torrent lines", file: ptr(lines(maxBatchEntries-1) + "a.torrent\nhttp://h/b.torrent\n"), args: []string{"list.txt"}, wantErr: "list.txt:10001: more than 10000 entries"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			if tc.file != nil {
-				if err := os.WriteFile(filepath.Join(dir, "list.txt"), []byte(*tc.file), 0o600); err != nil {
+				path := filepath.Join(dir, cmp.Or(tc.path, "list.txt"))
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(*tc.file), 0o600); err != nil {
 					t.Fatal(err)
 				}
 			}
 			args := make([]string, len(tc.args))
 			for i, a := range tc.args {
-				if !strings.HasPrefix(strings.ToLower(a), "magnet:") {
+				if !isMagnet(a) {
 					a = filepath.Join(dir, a)
 				}
 				args[i] = a
@@ -69,13 +103,20 @@ func TestExpandMagnets(t *testing.T) {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
-				if !slices.Equal(got, tc.want) {
-					t.Errorf("got %q, want %q", got, tc.want)
+				want := slices.Clone(tc.want)
+				for i := range want {
+					want[i].ref = strings.ReplaceAll(want[i].ref, "$DIR", dir)
+				}
+				if !slices.Equal(got, want) {
+					t.Errorf("got %+v, want %+v", got, want)
 				}
 				return
 			}
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("error = %v, want it to contain %q", err, tc.wantErr)
+			}
+			if strings.Contains(err.Error(), "secret") {
+				t.Errorf("error = %v, leaks credentials", err)
 			}
 			if tc.wantIs != nil && !errors.Is(err, tc.wantIs) {
 				t.Errorf("error = %v, want errors.Is %v", err, tc.wantIs)
@@ -85,24 +126,34 @@ func TestExpandMagnets(t *testing.T) {
 }
 
 func FuzzReadBatchFile(f *testing.F) {
-	for _, s := range []string{"", "\n", "magnet:?a\n", "\uFEFFmagnet:?a\r\n\n MAGNET:?b \n", "magnet:?a\nnope\n", "\x00\xff\r\r\n"} {
+	for _, s := range []string{"", "\n", "magnet:?a\n", "\uFEFFmagnet:?a\r\n\n MAGNET:?b \n", "magnet:?a\nnope\n", "\x00\xff\r\r\n", "a.torrent\nhttps://h/x\n", "ftp://h/x.torrent\n"} {
 		f.Add([]byte(s))
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
-		path := filepath.Join(t.TempDir(), "list.txt")
+		dir := t.TempDir()
+		path := filepath.Join(dir, "list.txt")
 		if err := os.WriteFile(path, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		uris, err := readBatchFile(path)
+		refs, err := readBatchFile(path)
 		if err != nil {
 			return
 		}
-		if len(uris) == 0 || len(uris) > maxBatchEntries {
-			t.Fatalf("got %d URIs without error", len(uris))
+		if len(refs) == 0 || len(refs) > maxBatchEntries {
+			t.Fatalf("got %d entries without error", len(refs))
 		}
-		for _, u := range uris {
-			if !strings.HasPrefix(strings.ToLower(u), "magnet:") || u != strings.TrimSpace(u) || strings.Contains(u, "\n") {
-				t.Fatalf("bad URI %q", u)
+		for _, r := range refs {
+			if strings.ContainsAny(r.ref, "\r\n") || r.ref != strings.TrimSpace(r.ref) {
+				t.Fatalf("bad entry %q", r.ref)
+			}
+			if !r.torrent {
+				if !isMagnet(r.ref) {
+					t.Fatalf("bad magnet %q", r.ref)
+				}
+				continue
+			}
+			if u, err := parseTorrentURL(r.ref); err != nil || u == nil && (!strings.EqualFold(filepath.Ext(r.ref), ".torrent") || !filepath.IsAbs(r.ref)) {
+				t.Fatalf("bad torrent entry %q (url err %v)", r.ref, err)
 			}
 		}
 	})
@@ -195,10 +246,10 @@ func TestResolveSourcesAndDedupe(t *testing.T) {
 	magnetSample := "magnet:?xt=urn:btih:" + strings.ToUpper(sampleHash)
 	magnetOther := "magnet:?xt=urn:btih:" + strings.Repeat("ab", 20)
 
-	srcs := dedupe(resolveSources(t.Context(), nil,
+	srcs := dedupe(resolveSources(t.Context(), nil, refs(
 		[]string{magnetSample, magnetOther, "magnet:?xt=urn:btih:zz", magnetOther, "magnet:?dn=nohash"},
 		[]string{sample, missing, sample},
-	))
+	)))
 
 	type row struct {
 		ref     string
@@ -234,6 +285,18 @@ func TestResolveSourcesAndDedupe(t *testing.T) {
 	if !errors.Is(srcs[4].err, os.ErrNotExist) {
 		t.Errorf("missing file error = %v, want errors.Is os.ErrNotExist", srcs[4].err)
 	}
+}
+
+// refs returns magnets then torrents as sourceRefs, as run orders them.
+func refs(magnets, torrents []string) []sourceRef {
+	var out []sourceRef
+	for _, m := range magnets {
+		out = append(out, sourceRef{ref: m})
+	}
+	for _, t := range torrents {
+		out = append(out, sourceRef{ref: t, torrent: true})
+	}
+	return out
 }
 
 // manyFiles returns a bencoded metainfo whose v1 info lists n empty files.
@@ -476,10 +539,10 @@ func TestResolveSourcesURLs(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(sample) }))
 	t.Cleanup(srv.Close)
 
-	srcs := dedupe(resolveSources(t.Context(), newHTTPClient(fetchTimeout),
+	srcs := dedupe(resolveSources(t.Context(), newHTTPClient(fetchTimeout), refs(
 		[]string{"magnet:?xt=urn:btih:" + sampleHash},
 		[]string{"ftp://u:secret@h/x.torrent", srv.URL + "/x.torrent?k=secret", filepath.Join("testdata", "sample.torrent")},
-	))
+	)))
 	// The magnet is replaced by the URL source (it has the info dict); the
 	// local file is a duplicate of it.
 	if len(srcs) != 2 {
@@ -493,5 +556,58 @@ func TestResolveSourcesURLs(t *testing.T) {
 	}
 	if s := srcs[1]; s.ref != "(rejected URL)" || s.err == nil || !strings.Contains(s.err.Error(), `unsupported scheme "ftp"`) || strings.Contains(s.err.Error(), "secret") {
 		t.Errorf("[1] = %q, %v; want a redacted unsupported-scheme error", s.ref, s.err)
+	}
+}
+
+// TestBatchFileSources runs a mixed batch file through to resolved sources:
+// entry order is kept and a relative .torrent path is found next to the batch
+// file, not in the working directory.
+func TestBatchFileSources(t *testing.T) {
+	sample, err := os.ReadFile(filepath.Join("testdata", "sample.torrent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	// Run from an unrelated directory so a CWD-relative lookup would fail.
+	t.Chdir(t.TempDir())
+	dir := filepath.Join(t.TempDir(), "batch")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "rel.torrent"), sample, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	magnet := "magnet:?xt=urn:btih:" + strings.Repeat("ab", 20)
+	list := filepath.Join(dir, "list.txt")
+	gone := srv.URL + "/gone.torrent?k=secret"
+	if err := os.WriteFile(list, []byte(magnet+"\nrel.torrent\n"+gone+"\n"+gone+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rs, err := expandMagnets([]string{list})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcs := dedupe(resolveSources(t.Context(), newHTTPClient(fetchTimeout), rs))
+	if len(srcs) != 3 {
+		t.Fatalf("got %d sources, want 3", len(srcs))
+	}
+	if s := srcs[0]; s.ref != magnet || s.err != nil {
+		t.Errorf("[0] = %q, %v; want the magnet", s.ref, s.err)
+	}
+	if s := srcs[1]; s.ref != filepath.Join(dir, "rel.torrent") || s.err != nil || s.spec.InfoHash.HexString() != sampleHash {
+		t.Errorf("[1] = %q, %v; want the relative .torrent loaded", s.ref, s.err)
+	}
+	if s := srcs[2]; s.ref != srv.URL+"/gone.torrent?REDACTED" || s.err == nil || !strings.Contains(s.err.Error(), "HTTP 404") {
+		t.Errorf("[2] = %q, %v; want a redacted 404 failure", s.ref, s.err)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Errorf("repeated URL fetched %d times, want 1", n)
 	}
 }
