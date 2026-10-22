@@ -3,8 +3,12 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/anacrolix/torrent/metainfo"
 )
@@ -190,7 +195,7 @@ func TestResolveSourcesAndDedupe(t *testing.T) {
 	magnetSample := "magnet:?xt=urn:btih:" + strings.ToUpper(sampleHash)
 	magnetOther := "magnet:?xt=urn:btih:" + strings.Repeat("ab", 20)
 
-	srcs := dedupe(resolveSources(
+	srcs := dedupe(resolveSources(t.Context(), nil,
 		[]string{magnetSample, magnetOther, "magnet:?xt=urn:btih:zz", magnetOther, "magnet:?dn=nohash"},
 		[]string{sample, missing, sample},
 	))
@@ -267,4 +272,226 @@ func FuzzCheckBencodeShape(f *testing.F) {
 		// Anything that passes must decode without a stack overflow.
 		_, _ = metainfo.Load(bytes.NewReader(data))
 	})
+}
+
+func TestParseTorrentURL(t *testing.T) {
+	tests := []struct {
+		ref     string
+		want    string // "" = local path
+		wantErr string
+	}{
+		{ref: "x.torrent"},
+		{ref: "dir/x.torrent"},
+		{ref: `C:\x.torrent`},
+		{ref: "1x://h/x.torrent"},  // not a scheme: starts with a digit
+		{ref: "dir/a://b.torrent"}, // not a scheme: contains "/"
+		{ref: "https://example.org/x.torrent", want: "https://example.org/x.torrent"},
+		{ref: "HTTP://example.org/x.torrent", want: "http://example.org/x.torrent"},
+		{ref: "ftp://example.org/x.torrent", wantErr: `unsupported scheme "ftp"`},
+		{ref: "file:///etc/x.torrent", wantErr: `unsupported scheme "file"`},
+		{ref: "https:///x.torrent", wantErr: "no host"},
+		{ref: "https://u:secret@[::1/x?token=secret", wantErr: "invalid torrent URL"},
+		{ref: "ftp://u:secret@h/x?token=secret", wantErr: `"ftp://REDACTED@h/x?REDACTED"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.ref, func(t *testing.T) {
+			u, err := parseTorrentURL(tc.ref)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %v, want it to contain %q", err, tc.wantErr)
+				}
+				if strings.Contains(err.Error(), "secret") {
+					t.Errorf("error leaks credentials: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tc.want == "" {
+				if u != nil {
+					t.Errorf("got URL %v, want local path", u)
+				}
+				return
+			}
+			if u == nil || u.String() != tc.want {
+				t.Errorf("got %v, want %s", u, tc.want)
+			}
+		})
+	}
+}
+
+func TestFetchTorrent(t *testing.T) {
+	sample, err := os.ReadFile(filepath.Join("testdata", "sample.torrent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ok", func(w http.ResponseWriter, r *http.Request) {
+		if r.Referer() != "" {
+			http.Error(w, "referer leaked", http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write(sample)
+	})
+	mux.HandleFunc("/invalid", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("<html>not bencode</html>")) })
+	mux.HandleFunc("/big", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(make([]byte, maxTorrentFileSize+1)) // Content-Length is set
+	})
+	mux.HandleFunc("/big-chunked", func(w http.ResponseWriter, _ *http.Request) {
+		chunk := make([]byte, 1<<20)
+		for range maxTorrentFileSize>>20 + 1 {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush() // no Content-Length
+		}
+	})
+	mux.HandleFunc("/fail", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) })
+	mux.HandleFunc("/slow", func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
+	mux.HandleFunc("/to-ok", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/ok", http.StatusFound) })
+	mux.HandleFunc("/to-ftp", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "ftp://example.org/x.torrent", http.StatusFound)
+	})
+	mux.HandleFunc("/loop", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/loop", http.StatusFound) })
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	tests := []struct {
+		name    string
+		path    string
+		ctx     context.Context // nil = t.Context()
+		timeout time.Duration   // 0 = fetchTimeout
+		wantErr string
+		wantIs  error
+	}{
+		{name: "success", path: "/ok"},
+		{name: "redirect", path: "/to-ok"},
+		{name: "404", path: "/missing", wantErr: "HTTP 404 Not Found"},
+		{name: "500", path: "/fail", wantErr: "HTTP 500 Internal Server Error"},
+		{name: "invalid body", path: "/invalid", wantErr: "not a valid .torrent file"},
+		{name: "oversize", path: "/big", wantErr: "larger than 8 MiB"},
+		{name: "oversize chunked", path: "/big-chunked", wantErr: "larger than 8 MiB"},
+		{name: "timeout", path: "/slow", timeout: 50 * time.Millisecond, wantErr: "/slow"},
+		{name: "cancelled", path: "/slow", ctx: cancelled, wantErr: "context canceled", wantIs: context.Canceled},
+		{name: "redirect to ftp", path: "/to-ftp", wantErr: `redirect to unsupported scheme "ftp"`},
+		{name: "redirect loop", path: "/loop", wantErr: "more than 5 redirects"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := tc.ctx
+			if ctx == nil {
+				ctx = t.Context()
+			}
+			timeout := tc.timeout
+			if timeout == 0 {
+				timeout = fetchTimeout
+			}
+			u, err := parseTorrentURL(srv.URL + tc.path + "?token=secret")
+			if err != nil || u == nil {
+				t.Fatalf("parseTorrentURL = %v, %v", u, err)
+			}
+			src := resolveTorrentURL(ctx, newHTTPClient(timeout), u)
+			if want := srv.URL + tc.path + "?REDACTED"; src.ref != want {
+				t.Errorf("ref = %q, want %q", src.ref, want)
+			}
+			if tc.wantErr == "" {
+				if src.err != nil {
+					t.Fatalf("unexpected error: %v", src.err)
+				}
+				if got := src.spec.InfoHash.HexString(); got != sampleHash {
+					t.Errorf("infohash = %s, want %s", got, sampleHash)
+				}
+				return
+			}
+			if src.err == nil || !strings.Contains(src.err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want it to contain %q", src.err, tc.wantErr)
+			}
+			if msg := src.err.Error(); strings.Contains(msg, "secret") || !strings.Contains(msg, srv.URL+tc.path) {
+				t.Errorf("error = %q, want it to name the URL without its query", msg)
+			}
+			if tc.wantIs != nil && !errors.Is(src.err, tc.wantIs) {
+				t.Errorf("error = %v, want errors.Is %v", src.err, tc.wantIs)
+			}
+			if tc.timeout != 0 {
+				if ne, ok := errors.AsType[net.Error](src.err); !ok || !ne.Timeout() {
+					t.Errorf("error = %v, want a net.Error timeout", src.err)
+				}
+			}
+		})
+	}
+}
+
+func TestFetchTorrentCancelInFlight(t *testing.T) {
+	started := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		<-started
+		cancel()
+	}()
+	u, err := parseTorrentURL(srv.URL + "/x.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fetchTorrent(ctx, newHTTPClient(fetchTimeout), u); !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want errors.Is context.Canceled", err)
+	}
+}
+
+func TestFetchTorrentRejectsDowngrade(t *testing.T) {
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("plain-http target was requested")
+	}))
+	t.Cleanup(plain.Close)
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+"/x.torrent", http.StatusFound)
+	}))
+	t.Cleanup(tlsSrv.Close)
+
+	hc := newHTTPClient(fetchTimeout)
+	hc.Transport = tlsSrv.Client().Transport // trust the test certificate
+	u, err := parseTorrentURL(tlsSrv.URL + "/x.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fetchTorrent(t.Context(), hc, u); err == nil || !strings.Contains(err.Error(), "redirect from https to http") {
+		t.Errorf("error = %v, want a downgrade error", err)
+	}
+}
+
+func TestResolveSourcesURLs(t *testing.T) {
+	sample, err := os.ReadFile(filepath.Join("testdata", "sample.torrent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(sample) }))
+	t.Cleanup(srv.Close)
+
+	srcs := dedupe(resolveSources(t.Context(), newHTTPClient(fetchTimeout),
+		[]string{"magnet:?xt=urn:btih:" + sampleHash},
+		[]string{"ftp://u:secret@h/x.torrent", srv.URL + "/x.torrent?k=secret", filepath.Join("testdata", "sample.torrent")},
+	))
+	// The magnet is replaced by the URL source (it has the info dict); the
+	// local file is a duplicate of it.
+	if len(srcs) != 2 {
+		for _, s := range srcs {
+			t.Logf("got %q err=%v", s.ref, s.err)
+		}
+		t.Fatalf("got %d sources, want 2", len(srcs))
+	}
+	if want := srv.URL + "/x.torrent?REDACTED"; srcs[0].ref != want || srcs[0].err != nil {
+		t.Errorf("[0] = %q, %v; want %q, no error", srcs[0].ref, srcs[0].err, want)
+	}
+	if s := srcs[1]; s.ref != "(rejected URL)" || s.err == nil || !strings.Contains(s.err.Error(), `unsupported scheme "ftp"`) || strings.Contains(s.err.Error(), "secret") {
+		t.Errorf("[1] = %q, %v; want a redacted unsupported-scheme error", s.ref, s.err)
+	}
 }

@@ -46,7 +46,7 @@ that's on your `PATH`.
 ## Usage
 
 ```sh
-magneto [-magnet <uri|file>[,...]]... [-torrent <file>[,...]]... [-parallel N] [-out <dir>] [-no-seed=<bool>]
+magneto [-magnet <uri|file>[,...]]... [-torrent <file|url>[,...]]... [-parallel N] [-out <dir>] [-no-seed=<bool>]
 ```
 
 At least one `-magnet` or `-torrent` is required.
@@ -54,7 +54,7 @@ At least one `-magnet` or `-torrent` is required.
 | Flag        | Default       | Description                                                        |
 |-------------|---------------|--------------------------------------------------------------------|
 | `-magnet`   |               | Magnet link or batch file; repeat the flag or pass a comma list    |
-| `-torrent`  |               | Local `.torrent` file; repeat the flag or pass a comma list        |
+| `-torrent`  |               | `.torrent` file path or http(s) URL; repeat or pass a comma list   |
 | `-parallel` | `0`           | Max simultaneous downloads (`0` = all at once)                     |
 | `-out`      | `./Downloads` | Download directory                                                 |
 | `-no-seed`  | `true`        | Disable seeding after download completes                           |
@@ -82,7 +82,7 @@ magneto -out ~/media -magnet "season1.txt,season2.txt"
 Every `-magnet` value is split on commas, so a batch-file path containing a
 comma isn't supported; rename the file or pass a path without one.
 
-`-torrent` loads local `.torrent` files (up to 32 MiB each) and can be mixed
+`-torrent` loads local `.torrent` files (up to 8 MiB each) and can be mixed
 with `-magnet` in the same run; they share the same concurrency, `-parallel`
 limit and progress display. Its values are split on commas too. Duplicates are
 matched by infohash, so the same torrent given as a magnet and as a `.torrent`
@@ -91,6 +91,21 @@ reported with its path as one failed download; the others still run:
 
 ```sh
 magneto -out ~/media -torrent show.torrent -torrent "a.torrent,b.torrent" -magnet season1.txt
+```
+
+A `-torrent` value of the form `http://...` or `https://...` is fetched
+before downloads start, then handled like a local file. Any other
+`scheme://` value (`file://`, `ftp://`, …) is rejected; a value without
+`://` is a local path. Fetches run one at a time, are cancelled by Ctrl+C,
+time out after 30 seconds, follow at most 5 redirects (which must stay on
+http or https, never downgrade from https, and send no `Referer`), and fail if the body is larger than 8 MiB, the status is not
+2xx, or the body isn't a valid `.torrent`. A failing URL is reported as one
+failed download, with credentials and the query string replaced by
+`REDACTED` (the path is shown as given, so don't put secrets in it). Because values are split on commas, a URL containing a comma
+isn't supported:
+
+```sh
+magneto -out ~/media -torrent https://example.org/show.torrent -torrent local.torrent
 ```
 
 On a terminal, each torrent gets one line, ordered by its position, that is
@@ -107,7 +122,7 @@ lines stay visible and the rest are summarised as `… N more (X done, Y
 queued)`. A failed torrent's line shows `failed`. When output is not a
 terminal (a pipe, file, `docker logs`, or `TERM=dumb`), each update is
 printed as a new plain line instead, with no ANSI escape codes. Control
-characters in torrent names and file paths are stripped from all output. A failing magnet or `.torrent` is logged and does not
+characters in torrent names and file paths are stripped from all output. A failing magnet, `.torrent` file or URL is logged and does not
 stop the others; the exit code is non-zero if any download failed.
 
 Running from source with `go run`, `-out` defaults to a `Downloads`
@@ -143,7 +158,7 @@ cp completions/magneto.fish ~/.config/fish/completions/
 ```
 
 `-magnet` completes file paths (for batch files) and `-torrent` completes
-`*.torrent` files in all three shells.
+`*.torrent` files in all three shells (URLs are typed as-is).
 
 ## Docker
 
