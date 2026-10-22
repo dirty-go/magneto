@@ -67,16 +67,29 @@ magneto -out ~/media -parallel 2 -magnet "magnet:?xt=...,magnet:?xt=...,magnet:?
 ```
 
 A `-magnet` value starting with `magnet:` (case-insensitive) is a URI; any
-other value is read as a batch file with one magnet URI per line. Blank
+other value is read as a batch file with one entry per line. Each entry is a
+magnet URI, an `http://` or `https://` `.torrent` URL, or a path ending in
+`.torrent` (case-insensitive); a relative path is resolved against the batch
+file's directory, not the current one. Entries download exactly as if given
+with `-magnet` or `-torrent`, so a missing `.torrent` file or failing URL is
+one failed download. A batch file can't include another batch file. Blank
 lines are skipped, surrounding whitespace and CRLF endings are trimmed, and a
-leading UTF-8 BOM is ignored. A missing or non-regular file, a line that isn't
-a magnet URI (reported as `file:line`), a file with no URIs, or more than
-10,000 URIs in one file is a fatal error. Files and URIs can be mixed freely,
-and duplicates are dropped:
+leading UTF-8 BOM is ignored. A missing or non-regular file, a line that is
+none of the above (reported as `file:line`), a file with no entries, or more
+than 10,000 entries in one file is a fatal error. Files and URIs can be mixed
+freely, and duplicates are dropped:
 
 ```sh
 magneto -out ~/media -magnet season1.txt -magnet "magnet:?xt=urn:btih:CCC..."
 magneto -out ~/media -magnet "season1.txt,season2.txt"
+```
+
+where `season1.txt` might hold:
+
+```text
+magnet:?xt=urn:btih:AAA...
+episodes/e02.torrent
+https://example.org/e03.torrent
 ```
 
 Every `-magnet` value is split on commas, so a batch-file path containing a
